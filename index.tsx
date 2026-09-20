@@ -7,29 +7,73 @@
  *
  * V1 -> V2 mapping applied here:
  * - `api.kv` -> `context.storage.store("sdd-prefs", ...)` (durable JSON).
- *   V2 storage starts fresh; V1 kv keys (`sdd-show-model-badge`, ...) are
- *   NOT migrated automatically.
+ *   One-time copy-on-first-run from V1 keys is best-effort: the V2 TUI
+ *   context exposes no reader for the V1 host kv store, so a guarded probe
+ *   applies legacy values when present and fresh defaults otherwise.
  * - slots `home_bottom`/`sidebar_content` -> `home.footer.status` /
  *   `sidebar.content` via `context.ui.slot`.
  * - `api.keymap.registerLayer` -> `context.keymap.layer` inside the mounted
  *   `SddGlobalKeymap` component (mode `global`, one palette command).
  * - `api.ui.dialog` JSX components -> promise-based
  *   `context.ui.dialog.select/confirm/prompt` + `context.ui.toast.show`.
+ * - `api.state.provider/config` -> `context.data.location.*.sync()` +
+ *   `.list()` snapshots (`loadRuntimeSnapshot`), adapted to the V1 shape by
+ *   `buildV1Shim` so the tested pure helpers in `src/dialogs.tsx`,
+ *   `src/profiles.ts`, and `src/profile-reasoning.ts` are reused unchanged.
+ *   `src/dialogs.tsx` itself is untouched (server/tests import it).
  *
- * Full 15-dialog port is deferred: every stub below names the V1 source in
- * src/dialogs.tsx to port next.
+ * Ported from V1 `src/dialogs.tsx`: showCreateProfile, showProfileList,
+ * showProfileDetail (hub + primary/reasoning/fallback submenus, provider and
+ * model pickers, bulk actions, versions, delete), handleActivateProfile,
+ * showRenameProfile. The project memory browser
+ * (showProjectMemoriesMenu ~line 1290) still shows a count toast until its
+ * port lands.
  */
 
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { Plugin, usePlugin } from "@opencode/plugin/tui";
 import type { Context } from "@opencode/plugin/tui/context";
 import { Show } from "solid-js";
 import { formatActiveModelBadgeText } from "./components";
 import { createLogger } from "./src/logger";
+import { ensureProfilesDir, resolvePaths } from "./src/config";
+import {
+	activateProfileFile,
+	deleteProfileFile,
+	detectActiveProfileFile,
+	listProfileFiles,
+	listProfileVersions,
+	readProfileData,
+	readProfileVersion,
+	renameProfileFile,
+	restoreProfileVersion,
+	sanitizeProfileName,
+	updateProfilePhaseModel,
+	updateProfileWithBulkPhaseAssignment,
+	writeProfileData,
+	writeProfileModels,
+} from "./src/profiles";
+import { buildReasoningEditState, updateProfileReasoningEffort } from "./src/profile-reasoning";
+import {
+	buildBulkProfileActionOptions,
+	buildFallbackSubmenuOptions,
+	buildPrimaryModelSubmenuOptions,
+	buildProfileDetailAgentSections,
+	buildProfileDetailHubOptions,
+	buildReasoningBlockedMessage,
+	buildReasoningSubmenuOptions,
+	buildProfileVersionListOption,
+	formatProfileVersionPreviewLines,
+	resolveProfileDetailNavigationAction,
+	resolveProfileDetailSelectionAction,
+	resolveRuntimeOrchestratorPolicy,
+} from "./src/dialogs";
 import { listProjectMemories } from "./src/memories";
-import { listProfileFiles } from "./src/profiles";
+import { setActiveProfile } from "./src/state";
+import { NAV_CATEGORY } from "./src/types";
 import type { ActiveProfileState } from "./src/types";
-import { isPrimarySddAgent } from "./src/utils";
+import { formatContext, formatMemoryDate, isPrimarySddAgent, parseActiveProfileFromRaw, truncateText } from "./src/utils";
 
 const log = createLogger("tui");
 
@@ -41,6 +85,8 @@ type SddPrefs = {
 	displayMode: "model" | "profile";
 	activeProfileName: string;
 };
+
+type UpdatePrefs = (mutation: (draft: SddPrefs) => void) => Promise<void>;
 
 const initialPrefs: SddPrefs = {
 	badgeVisible: true,
@@ -169,38 +215,668 @@ function toast(context: Context, options: { title?: string; message: string; var
 	}
 }
 
-async function openProfileHub(
-	context: Context,
-	fileName: string,
-): Promise<void> {
-	const title = fileName.replace(/\.json$/, "");
-	const choice = await context.ui.dialog.select({
-		title: `Profile: ${title}`,
-		options: [
-			{ title: "Activate profile", value: "activate", description: "Apply to global configuration" },
-			{ title: "Rename profile", value: "rename", description: "Rename the profile file" },
-			{ title: "Back", value: "__back__" },
-		],
-	});
-	if (choice === "activate") {
-		const confirmed = await context.ui.dialog.confirm({
-			title: "Activate profile",
-			message: `Apply '${title}' to the global configuration?`,
-		});
-		if (!confirmed) return;
-		// TODO(tui-v2): port activation (V1 src/dialogs.tsx handleActivateProfile ~line 856).
-		toast(context, { title: "Not yet ported", message: `Activation of '${title}' lands with the full dialog port.`, variant: "warning" });
-		return;
-	}
-	if (choice === "rename") {
-		const next = await context.ui.dialog.prompt({ title: "Rename profile", value: title });
-		if (!next || next.trim() === title) return;
-		// TODO(tui-v2): port rename (V1 src/dialogs.tsx showRenameProfile ~line 907).
-		toast(context, { title: "Not yet ported", message: `Rename to '${next.trim()}' lands with the full dialog port.`, variant: "warning" });
+// ---------------------------------------------------------------------------
+// V2 runtime snapshot (replaces V1 `api.state.*` reads)
+// ---------------------------------------------------------------------------
+
+/** V1-shaped provider (with embedded models) rebuilt from V2 location data. */
+type V1ProviderShape = {
+	id: string;
+	name: string;
+	models: Record<string, { name?: string; limit?: { context?: number }; capabilities?: unknown; variants?: unknown }>;
+};
+
+type RuntimeSnapshot = {
+	providers: V1ProviderShape[];
+	agentMap: Record<string, { model?: string }>;
+	defaultAgent?: string;
+};
+
+function readGlobalConfigFile(configPath: string): any {
+	try {
+		if (!fs.existsSync(configPath)) return {};
+		return JSON.parse(fs.readFileSync(configPath, "utf-8"));
+	} catch (error) {
+		log.warn(`readGlobalConfigFile: failed to parse ${configPath}`, error);
+		return {};
 	}
 }
 
-async function openProfileList(context: Context): Promise<void> {
+async function resolveDefaultAgent(context: Context): Promise<string | undefined> {
+	try {
+		const entries = await context.client.config.get();
+		for (const entry of entries ?? []) {
+			const defaultAgent = (entry as unknown as { info?: { default_agent?: unknown } })?.info?.default_agent;
+			if (typeof defaultAgent === "string" && defaultAgent.trim()) return defaultAgent.trim();
+		}
+	} catch (error) {
+		log.warn("resolveDefaultAgent: config.get failed", error);
+	}
+	return undefined;
+}
+
+/**
+ * Syncs and lists V2 location data (providers, models, agents) in one place.
+ * Every dialog flow reads providers/config through the returned snapshot
+ * instead of V1 `api.state.*`.
+ */
+async function loadRuntimeSnapshot(context: Context): Promise<RuntimeSnapshot> {
+	const location = context.location;
+	const labels = ["provider", "model", "agent"] as const;
+	const settled = await Promise.allSettled([
+		context.data.location.provider.sync(location),
+		context.data.location.model.sync(location),
+		context.data.location.agent.sync(location),
+	]);
+	settled.forEach((result, index) => {
+		if (result.status === "rejected") {
+			log.warn(`loadRuntimeSnapshot: ${labels[index]}.sync failed`, result.reason);
+		}
+	});
+
+	let providerInfos: Array<{ id: string; name?: string }> = [];
+	let modelInfos: Array<{
+		providerID: string;
+		modelID: string;
+		name?: string;
+		limit?: { context?: number };
+		capabilities?: unknown;
+		variants?: unknown;
+	}> = [];
+	let agentInfos: Array<{ name: string; model?: { providerID: string; id: string } }> = [];
+	try {
+		providerInfos = context.data.location.provider.list(location) ?? [];
+	} catch (error) {
+		log.warn("loadRuntimeSnapshot: provider.list failed", error);
+	}
+	try {
+		modelInfos = context.data.location.model.list(location) ?? [];
+	} catch (error) {
+		log.warn("loadRuntimeSnapshot: model.list failed", error);
+	}
+	try {
+		agentInfos = context.data.location.agent.list(location) ?? [];
+	} catch (error) {
+		log.warn("loadRuntimeSnapshot: agent.list failed", error);
+	}
+
+	const providersById = new Map<string, V1ProviderShape>();
+	for (const provider of providerInfos) {
+		providersById.set(provider.id, { id: provider.id, name: provider.name || provider.id, models: {} });
+	}
+	for (const model of modelInfos) {
+		let entry = providersById.get(model.providerID);
+		if (!entry) {
+			entry = { id: model.providerID, name: model.providerID, models: {} };
+			providersById.set(model.providerID, entry);
+		}
+		entry.models[model.modelID] = {
+			name: model.name || model.modelID,
+			...(model.limit?.context ? { limit: { context: model.limit.context } } : {}),
+			...(model.capabilities !== undefined ? { capabilities: model.capabilities } : {}),
+			...(model.variants !== undefined ? { variants: model.variants } : {}),
+		};
+	}
+	// Match V1 pickers: only providers that can offer a model.
+	const providers = [...providersById.values()].filter(
+		(provider) => Object.keys(provider.models).length > 0,
+	);
+
+	const agentMap: Record<string, { model?: string }> = {};
+	for (const agent of agentInfos) {
+		agentMap[agent.name] = {
+			...(agent.model ? { model: `${agent.model.providerID}/${agent.model.id}` } : {}),
+		};
+	}
+
+	const defaultAgent = await resolveDefaultAgent(context);
+	return { providers, agentMap, ...(defaultAgent ? { defaultAgent } : {}) };
+}
+
+/**
+ * Adapts the V2 context plus a runtime snapshot to the V1 `api` shape
+ * consumed by the untouched helpers in `src/dialogs.tsx`/`src/profiles.ts`.
+ *
+ * Differences bridged here:
+ * - `state.provider/config` come from the snapshot (synced V2 location data).
+ * - `client.global.config.update` has no V2 equivalent (V2 `config.update`
+ *   only manages shell settings), so activation persists the merged config
+ *   file directly — the same file V1 used as source-of-truth — then nudges
+ *   the server with a best-effort `location.reload()`.
+ * - `ui.toast` forwards to `context.ui.toast.show`.
+ */
+function buildV1Shim(context: Context, snapshot: RuntimeSnapshot): any {
+	const { configPath } = resolvePaths();
+	return {
+		state: {
+			provider: snapshot.providers,
+			config: {
+				agent: snapshot.agentMap,
+				...(snapshot.defaultAgent ? { default_agent: snapshot.defaultAgent } : {}),
+			},
+		},
+		client: {
+			global: {
+				config: {
+					get: async () => ({ data: readGlobalConfigFile(configPath) }),
+					update: async ({ config }: any) => {
+						fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+						try {
+							await context.client.location.reload();
+						} catch (error) {
+							log.warn("v1shim: location.reload after config update failed", error);
+						}
+						return {};
+					},
+				},
+			},
+		},
+		ui: {
+			toast: (options: any) => {
+				toast(context, options);
+			},
+		},
+	};
+}
+
+// ---------------------------------------------------------------------------
+// Profile flows (V2 promise-chain ports of V1 `src/dialogs.tsx`)
+// ---------------------------------------------------------------------------
+
+type ProfileOpt = { title: string; value: string };
+
+/** Ports V1 `handleActivateProfile` (~line 856). */
+async function activateProfileFlow(
+	context: Context,
+	snapshot: RuntimeSnapshot,
+	profilePath: string,
+	profileName: string,
+	updatePrefs: UpdatePrefs,
+): Promise<void> {
+	const api = buildV1Shim(context, snapshot);
+	const updatedConfig = await activateProfileFile(api, profilePath, profileName);
+	if (!updatedConfig) return;
+
+	try {
+		await updatePrefs((draft) => {
+			draft.activeProfileName = profileName;
+		});
+	} catch (error) {
+		log.warn("activateProfileFlow: failed to persist active profile name", error);
+	}
+
+	// Sync badge state after activation; attach profileName so it can render.
+	const next = parseActiveProfileFromRaw(JSON.stringify(updatedConfig), api);
+	setActiveProfile(next ? { ...next, profileName } : next);
+
+	await context.ui.dialog.confirm({
+		title: "Profile Activated",
+		message: `Profile '${profileName}' successfully applied to global configuration.`,
+	});
+}
+
+/** Ports V1 `showDeleteProfile` (called from the detail hub). Returns true when the detail loop should exit. */
+async function deleteProfileFlow(context: Context, profileOpt: ProfileOpt): Promise<boolean> {
+	const confirmed = await context.ui.dialog.confirm({
+		title: "Delete Profile",
+		message: `Permanently delete '${profileOpt.title}'?`,
+	});
+	if (!confirmed) return false;
+	try {
+		deleteProfileFile(profileOpt.value);
+		toast(context, { title: "Deleted", message: `Profile '${profileOpt.title}' deleted` });
+		return true;
+	} catch (error: any) {
+		log.warn(`deleteProfileFlow: failed to delete profile '${profileOpt.value}'`, error);
+		toast(context, { title: "Error", message: `Failed to delete: ${error?.message || error}`, variant: "error" });
+		return false;
+	}
+}
+
+/** Ports V1 `showRenameProfile` (~line 907). Returns the renamed opt, or null when the detail loop should exit. */
+async function renameProfileFlow(context: Context, profileOpt: ProfileOpt): Promise<ProfileOpt | null> {
+	const next = await context.ui.dialog.prompt({ title: "Rename Profile", value: profileOpt.title });
+	const trimmed = next?.trim();
+	if (!trimmed || trimmed === profileOpt.title) return profileOpt;
+
+	try {
+		const finalName = sanitizeProfileName(trimmed);
+		const newFileName = `${finalName}.json`;
+		const { profilesDir } = resolvePaths();
+		if (fs.existsSync(path.join(profilesDir, newFileName))) {
+			toast(context, { title: "Error", message: "A profile with this name already exists", variant: "error" });
+			return profileOpt;
+		}
+		renameProfileFile(profileOpt.value, newFileName);
+		toast(context, { title: "Renamed", message: `Profile renamed to '${finalName}'` });
+		return null;
+	} catch (error: any) {
+		log.warn(`renameProfileFlow: failed to rename profile '${profileOpt.value}' to '${next}'`, error);
+		toast(context, { title: "Error", message: `Failed to rename: ${error?.message || error}`, variant: "error" });
+		return profileOpt;
+	}
+}
+
+/** Ports the V1 provider picker + model picker for one agent (`mode` primary or fallback). */
+async function agentModelFlow(
+	context: Context,
+	snapshot: RuntimeSnapshot,
+	profileOpt: ProfileOpt,
+	agentName: string,
+	mode: "model" | "fallback",
+): Promise<void> {
+	const { profilesDir } = resolvePaths();
+	const profilePath = path.join(profilesDir, profileOpt.value);
+	const api = buildV1Shim(context, snapshot);
+	const providers = snapshot.providers;
+	if (providers.length === 0) {
+		toast(context, { title: "No Providers", message: "No authenticated providers found.", variant: "warning" });
+		return;
+	}
+
+	while (true) {
+		const providerChoice = await context.ui.dialog.select({
+			title: `Provider for ${agentName}${mode === "fallback" ? " (fallback)" : ""}`,
+			options: [
+				...providers.map((provider) => ({
+					title: provider.name || provider.id,
+					value: provider.id,
+					description: `${Object.keys(provider.models || {}).length} models available`,
+				})),
+				{ title: "← Back", value: "__back__", category: NAV_CATEGORY },
+			],
+		});
+		if (!providerChoice || providerChoice === "__back__") return;
+		const selected = providers.find((provider) => provider.id === providerChoice);
+		if (!selected) continue;
+
+		const models = selected.models || {};
+		const modelChoice = await context.ui.dialog.select({
+			title: `${selected.name || selected.id} › ${agentName}${mode === "fallback" ? " (fallback)" : ""}`,
+			options: [
+				...Object.keys(models).map((key) => {
+					const model = models[key];
+					const ctxText = model?.limit?.context ? formatContext(model.limit.context) : "ctx: N/A";
+					return {
+						title: model?.name || key,
+						value: `${selected.id}/${key}`,
+						description: ctxText,
+					};
+				}),
+				{ title: "← Back", value: "__back__", category: NAV_CATEGORY },
+			],
+		});
+		if (!modelChoice || modelChoice === "__back__") continue;
+
+		const runtimePolicy = resolveRuntimeOrchestratorPolicy(api.state.config);
+		try {
+			if (mode === "fallback") {
+				const result = updateProfilePhaseModel(profilePath, agentName, "fallback", modelChoice, runtimePolicy);
+				toast(context, {
+					title: result.changed ? "Updated" : "No Changes",
+					message: result.changed
+						? `${agentName} fallback set to ${modelChoice}. Version saved.`
+						: `${agentName} fallback already uses ${modelChoice}`,
+					variant: result.changed ? "success" : "warning",
+				});
+			} else {
+				const result = updateProfilePhaseModel(profilePath, agentName, "primary", modelChoice, runtimePolicy);
+				toast(context, {
+					title: result.changed ? "Updated" : "No Changes",
+					message: result.changed
+						? `${agentName} set to ${modelChoice}. Version saved.`
+						: `${agentName} already uses ${modelChoice}`,
+					variant: result.changed ? "success" : "warning",
+				});
+			}
+		} catch (error: any) {
+			log.warn(`agentModelFlow: failed to update ${agentName}`, error);
+			toast(context, { title: "Error", message: `Failed to update agent: ${error?.message || error}`, variant: "error" });
+		}
+		return;
+	}
+}
+
+/** Ports the V1 reasoning-effort picker for one agent. */
+async function reasoningEffortFlow(
+	context: Context,
+	snapshot: RuntimeSnapshot,
+	profileOpt: ProfileOpt,
+	agentName: string,
+): Promise<void> {
+	const { profilesDir } = resolvePaths();
+	const profilePath = path.join(profilesDir, profileOpt.value);
+	const api = buildV1Shim(context, snapshot);
+
+	try {
+		const profile = readProfileData(profilePath);
+		const modelId = profile?.models?.[agentName];
+		const current = profile?.configs?.[agentName]?.reasoningEffort;
+		const state = buildReasoningEditState(api.state.provider || [], agentName, modelId, current);
+
+		if (state.kind !== "selectable") {
+			toast(context, {
+				title: "Reasoning Unsupported",
+				message: buildReasoningBlockedMessage(state),
+				variant: "warning",
+			});
+			return;
+		}
+
+		const choice = await context.ui.dialog.select<string>({
+			title: `Reasoning effort › ${agentName}`,
+			options: [
+				...state.options.map((value: string) => ({
+					title: value,
+					value,
+					description: state.current === value ? "Current" : undefined,
+				})),
+				{ title: "Clear saved value", value: "__clear__", category: NAV_CATEGORY },
+				{ title: "← Back", value: "__back__", category: NAV_CATEGORY },
+			],
+		});
+		if (!choice || choice === "__back__") return;
+
+		const nextProfile = updateProfileReasoningEffort(profile, agentName, choice === "__clear__" ? "" : choice);
+		writeProfileData(profilePath, nextProfile, resolveRuntimeOrchestratorPolicy(api.state.config));
+		toast(context, { title: "Updated", message: `${agentName} reasoning effort updated`, variant: "success" });
+	} catch (error: any) {
+		log.warn(`reasoningEffortFlow: failed to update ${agentName}`, error);
+		toast(context, { title: "Error", message: `Failed to update reasoning effort: ${error?.message || error}`, variant: "error" });
+	}
+}
+
+/** Ports the V1 primary-models submenu. */
+async function primaryModelsFlow(context: Context, snapshot: RuntimeSnapshot, profileOpt: ProfileOpt): Promise<void> {
+	const api = buildV1Shim(context, snapshot);
+	while (true) {
+		const { profilesDir } = resolvePaths();
+		const profileData = readProfileData(path.join(profilesDir, profileOpt.value));
+		const sections = buildProfileDetailAgentSections(api.state.config, profileData);
+		const choice = await context.ui.dialog.select<string>({
+			title: `Primary models › ${profileOpt.title}`,
+			options: buildPrimaryModelSubmenuOptions(profileData, sections, api),
+		});
+		if (!choice || choice === "__back__") return;
+		const action = resolveProfileDetailSelectionAction(choice);
+		if (action.action === "model") {
+			await agentModelFlow(context, snapshot, profileOpt, action.agentName, "model");
+		}
+	}
+}
+
+/** Ports the V1 reasoning-effort submenu. */
+async function reasoningModelsFlow(context: Context, snapshot: RuntimeSnapshot, profileOpt: ProfileOpt): Promise<void> {
+	const api = buildV1Shim(context, snapshot);
+	while (true) {
+		const { profilesDir } = resolvePaths();
+		const profileData = readProfileData(path.join(profilesDir, profileOpt.value));
+		const sections = buildProfileDetailAgentSections(api.state.config, profileData);
+		const choice = await context.ui.dialog.select<string>({
+			title: `Reasoning effort › ${profileOpt.title}`,
+			options: buildReasoningSubmenuOptions(profileData, sections),
+		});
+		if (!choice || choice === "__back__") return;
+		const action = resolveProfileDetailSelectionAction(choice);
+		if (action.action === "reasoning") {
+			await reasoningEffortFlow(context, snapshot, profileOpt, action.agentName);
+		}
+	}
+}
+
+/** Ports the V1 fallback-models submenu. */
+async function fallbackModelsFlow(context: Context, snapshot: RuntimeSnapshot, profileOpt: ProfileOpt): Promise<void> {
+	const api = buildV1Shim(context, snapshot);
+	while (true) {
+		const { profilesDir } = resolvePaths();
+		const profileData = readProfileData(path.join(profilesDir, profileOpt.value));
+		const sections = buildProfileDetailAgentSections(api.state.config, profileData);
+		const choice = await context.ui.dialog.select<string>({
+			title: `Fallback models › ${profileOpt.title}`,
+			options: buildFallbackSubmenuOptions(profileData, sections, api),
+		});
+		if (!choice || choice === "__back__") return;
+		const action = resolveProfileDetailSelectionAction(choice);
+		if (action.action === "fallback") {
+			await agentModelFlow(context, snapshot, profileOpt, action.agentName, "fallback");
+		}
+	}
+}
+
+/** Ports the V1 bulk profile-action picker (fill/override across phases). */
+async function bulkActionsFlow(context: Context, snapshot: RuntimeSnapshot, profileOpt: ProfileOpt): Promise<void> {
+	const api = buildV1Shim(context, snapshot);
+	const actions = buildBulkProfileActionOptions();
+	while (true) {
+		const choice = await context.ui.dialog.select({
+			title: "Bulk profile actions",
+			options: [
+				...actions.map((action) => ({
+					title: action.title,
+					value: action.value,
+					description: action.requiresConfirmation
+						? "Requires confirmation before overwriting"
+						: "Fill only empty or unassigned entries",
+				})),
+				{ title: "← Back", value: "__back__", category: NAV_CATEGORY },
+			],
+		});
+		if (!choice || choice === "__back__") return;
+		const selected = actions.find((action) => action.value === choice);
+		if (!selected) continue;
+
+		if (selected.requiresConfirmation) {
+			const confirmed = await context.ui.dialog.confirm({
+				title: "Confirm bulk override",
+				message: `${selected.title} will replace existing targeted assignments in '${profileOpt.title}'. A dated version will be saved first.`,
+			});
+			if (!confirmed) continue;
+		}
+
+		const providers = snapshot.providers;
+		if (providers.length === 0) {
+			toast(context, { title: "No Providers", message: "No authenticated providers found.", variant: "warning" });
+			return;
+		}
+		const providerChoice = await context.ui.dialog.select({
+			title: `Provider › ${selected.title}`,
+			options: [
+				...providers.map((provider) => ({
+					title: provider.name || provider.id,
+					value: provider.id,
+					description: `${Object.keys(provider.models || {}).length} models available`,
+				})),
+				{ title: "← Back", value: "__back__", category: NAV_CATEGORY },
+			],
+		});
+		if (!providerChoice || providerChoice === "__back__") continue;
+		const provider = providers.find((entry) => entry.id === providerChoice);
+		if (!provider) continue;
+
+		const models = provider.models || {};
+		const modelChoice = await context.ui.dialog.select({
+			title: `${provider.name || provider.id} › ${selected.title}`,
+			options: [
+				...Object.keys(models).map((key) => {
+					const model = models[key];
+					const ctxText = model?.limit?.context ? formatContext(model.limit.context) : "ctx: N/A";
+					return { title: model?.name || key, value: `${provider.id}/${key}`, description: ctxText };
+				}),
+				{ title: "← Back", value: "__back__", category: NAV_CATEGORY },
+			],
+		});
+		if (!modelChoice || modelChoice === "__back__") continue;
+
+		const { profilesDir } = resolvePaths();
+		const profilePath = path.join(profilesDir, profileOpt.value);
+		try {
+			const primarySddAgentNames = Object.keys(api.state.config?.agent || {}).filter(isPrimarySddAgent);
+			const runtimePolicy = resolveRuntimeOrchestratorPolicy(api.state.config);
+			const { assignment } = updateProfileWithBulkPhaseAssignment(
+				profilePath,
+				primarySddAgentNames,
+				modelChoice,
+				selected.operation,
+				runtimePolicy,
+			);
+			const totalAssigned = assignment.modelsAssigned + assignment.fallbackAssigned;
+			toast(context, {
+				title: totalAssigned > 0 ? "Updated" : "No Changes",
+				message: totalAssigned > 0
+					? `${selected.title}: ${assignment.modelsAssigned} primary and ${assignment.fallbackAssigned} fallback assignments set to ${modelChoice}. Version saved.`
+					: "No targeted SDD primary or fallback phases required updates",
+				variant: totalAssigned > 0 ? "success" : "warning",
+			});
+		} catch (error: any) {
+			log.warn(`bulkActionsFlow: failed for profile '${profileOpt.value}'`, error);
+			toast(context, { title: "Error", message: `Failed to update phases: ${error?.message || error}`, variant: "error" });
+		}
+		return;
+	}
+}
+
+/** Ports the V1 profile-version browser (list, preview, restore). */
+async function profileVersionsFlow(context: Context, profileOpt: ProfileOpt): Promise<void> {
+	while (true) {
+		let versions;
+		try {
+			versions = listProfileVersions(profileOpt.value);
+		} catch (error: any) {
+			log.warn(`profileVersionsFlow: failed to list versions for '${profileOpt.value}'`, error);
+			toast(context, { title: "Version Error", message: error?.message || "Failed to list profile versions", variant: "error" });
+			return;
+		}
+		if (versions.length === 0) {
+			toast(context, { title: "No Versions", message: `No saved versions for '${profileOpt.title}'`, variant: "warning" });
+			return;
+		}
+		const choice = await context.ui.dialog.select({
+			title: `Versions: ${profileOpt.title}`,
+			options: [
+				...versions.map(buildProfileVersionListOption),
+				{ title: "← Back", value: "__back__", category: NAV_CATEGORY },
+			],
+		});
+		if (!choice || choice === "__back__") return;
+
+		let version;
+		try {
+			version = readProfileVersion(choice);
+		} catch (error: any) {
+			log.warn(`profileVersionsFlow: failed to read version '${choice}'`, error);
+			toast(context, { title: "Version Error", message: error?.message || "Failed to read profile version", variant: "error" });
+			continue;
+		}
+		const lines = formatProfileVersionPreviewLines(version);
+		const previewChoice = await context.ui.dialog.select({
+			title: `Preview: ${profileOpt.title}`,
+			options: [
+				...lines.map((line, index) => ({ title: line, value: `__line__${index}` })),
+				{ title: "↩ Restore this version", value: "__restore__", category: NAV_CATEGORY },
+				{ title: "← Back", value: "__back__", category: NAV_CATEGORY },
+			],
+		});
+		if (!previewChoice || previewChoice === "__back__") continue;
+		if (previewChoice !== "__restore__") continue;
+
+		const confirmed = await context.ui.dialog.confirm({
+			title: "Restore profile version",
+			message: `Restore '${profileOpt.title}' from this version? Current profile content will be overwritten.`,
+		});
+		if (!confirmed) continue;
+		try {
+			restoreProfileVersion(profileOpt.value, version.id);
+			toast(context, { title: "Restored", message: `Profile '${profileOpt.title}' restored`, variant: "success" });
+		} catch (error: any) {
+			log.warn(`profileVersionsFlow: failed to restore '${version.id}'`, error);
+			toast(context, { title: "Restore Failed", message: error?.message || "Failed to restore version", variant: "error" });
+		}
+		return;
+	}
+}
+
+/** Ports V1 `showProfileDetail` (~line 662): the per-profile hub with all sub-flows. */
+async function openProfileDetail(
+	context: Context,
+	snapshot: RuntimeSnapshot,
+	profileOpt: ProfileOpt,
+	updatePrefs: UpdatePrefs,
+): Promise<void> {
+	const api = buildV1Shim(context, snapshot);
+	const { profilesDir } = resolvePaths();
+	while (true) {
+		let profileData;
+		try {
+			profileData = readProfileData(path.join(profilesDir, profileOpt.value));
+		} catch (error) {
+			log.warn(`openProfileDetail: failed to read profile '${profileOpt.value}'`, error);
+			toast(context, { title: "Error", message: "Failed to read profile details", variant: "error" });
+			return;
+		}
+		const sections = buildProfileDetailAgentSections(api.state.config, profileData);
+		const choice = await context.ui.dialog.select({
+			title: `Profile: ${profileOpt.title}`,
+			options: buildProfileDetailHubOptions(api, profileOpt, profileData),
+		});
+		if (!choice || choice === "__back__") return;
+
+		if (choice === "__assign__") {
+			await activateProfileFlow(context, snapshot, path.join(profilesDir, profileOpt.value), profileOpt.title, updatePrefs);
+			continue;
+		}
+		if (choice === "__delete__") {
+			const exited = await deleteProfileFlow(context, profileOpt);
+			if (exited) return;
+			continue;
+		}
+		if (choice === "__rename__") {
+			const next = await renameProfileFlow(context, profileOpt);
+			// A rename moves the file V1 returns to the list for; any other
+			// outcome stays on the hub.
+			if (next === null) return;
+			continue;
+		}
+		if (choice === "__bulk_actions__") {
+			await bulkActionsFlow(context, snapshot, profileOpt);
+			continue;
+		}
+		if (choice === "__profile_versions__") {
+			await profileVersionsFlow(context, profileOpt);
+			continue;
+		}
+
+		const navAction = resolveProfileDetailNavigationAction(choice);
+		if (navAction.action === "submenu-primary") {
+			await primaryModelsFlow(context, snapshot, profileOpt);
+			continue;
+		}
+		if (navAction.action === "submenu-reasoning") {
+			await reasoningModelsFlow(context, snapshot, profileOpt);
+			continue;
+		}
+		if (navAction.action === "submenu-fallback") {
+			await fallbackModelsFlow(context, snapshot, profileOpt);
+			continue;
+		}
+
+		const selectionAction = resolveProfileDetailSelectionAction(choice);
+		if (selectionAction.action === "model") {
+			await agentModelFlow(context, snapshot, profileOpt, selectionAction.agentName, "model");
+		} else if (selectionAction.action === "reasoning") {
+			await reasoningEffortFlow(context, snapshot, profileOpt, selectionAction.agentName);
+		} else if (selectionAction.action === "fallback") {
+			await agentModelFlow(context, snapshot, profileOpt, selectionAction.agentName, "fallback");
+		}
+	}
+}
+
+/** Ports V1 `showProfileList` (~line 618). */
+async function openProfileList(
+	context: Context,
+	snapshot: RuntimeSnapshot,
+	updatePrefs: UpdatePrefs,
+): Promise<void> {
+	ensureProfilesDir();
 	let files: string[];
 	try {
 		files = listProfileFiles();
@@ -209,69 +885,138 @@ async function openProfileList(context: Context): Promise<void> {
 		files = [];
 	}
 	if (files.length === 0) {
-		toast(context, { title: "No profiles", message: "No saved profiles found. Create one first!", variant: "warning" });
+		toast(context, { title: "No Profiles", message: "No saved profiles found. Create one first!", variant: "warning" });
 		return;
 	}
-	const choice = await context.ui.dialog.select({
-		title: "Select SDD profile",
-		options: [
-			...files.map((file) => ({
-				title: file.replace(/\.json$/, ""),
-				value: file,
-				description: "SDD profile",
-			})),
-			{ title: "Back", value: "__back__" },
-		],
+	while (true) {
+		const api = buildV1Shim(context, snapshot);
+		const activeFile = detectActiveProfileFile(files, api);
+		const choice = await context.ui.dialog.select({
+			title: "Select SDD Profile",
+			...(activeFile ? { current: activeFile } : {}),
+			options: [
+				...files.map((file) => ({
+					title: `${file === activeFile ? "✓ " : ""}${file.replace(/\.json$/, "")}`,
+					value: file,
+					description: file === activeFile ? "✓ Active" : "SDD Profile",
+				})),
+				{ title: "← Back", value: "__back__", category: NAV_CATEGORY },
+			],
+		});
+		if (!choice || choice === "__back__") return;
+		await openProfileDetail(
+			context,
+			snapshot,
+			{ title: choice.replace(/\.json$/, ""), value: choice },
+			updatePrefs,
+		);
+		// Refresh the listing after detail flows (rename/delete change files).
+		try {
+			files = listProfileFiles();
+		} catch (error) {
+			log.warn("openProfileList: failed to refresh profiles", error);
+			return;
+		}
+		if (files.length === 0) {
+			toast(context, { title: "No Profiles", message: "No saved profiles found. Create one first!", variant: "warning" });
+			return;
+		}
+	}
+}
+
+/** Ports V1 `showCreateProfile` (~line 555). */
+async function openCreateProfile(
+	context: Context,
+	snapshot: RuntimeSnapshot,
+	updatePrefs: UpdatePrefs,
+): Promise<void> {
+	const { profilesDir } = resolvePaths();
+	ensureProfilesDir();
+
+	const name = await context.ui.dialog.prompt({
+		title: "New SDD Profile Name",
+		placeholder: "Enter profile name",
 	});
-	if (!choice || choice === "__back__") return;
-	// TODO(tui-v2): port full detail hub (V1 src/dialogs.tsx showProfileDetail ~line 662).
-	await openProfileHub(context, choice);
+	const trimmed = name?.trim();
+	if (!trimmed) return;
+
+	try {
+		const finalName = sanitizeProfileName(trimmed);
+		const fileName = `${finalName}.json`;
+		const profilePath = path.join(profilesDir, fileName);
+
+		if (fs.existsSync(profilePath)) {
+			toast(context, {
+				title: "Error",
+				message: `Profile '${finalName}' already exists`,
+				variant: "error",
+			});
+			return;
+		}
+
+		writeProfileModels(profilePath, {});
+		await openProfileDetail(context, snapshot, { title: finalName, value: fileName }, updatePrefs);
+		toast(context, {
+			title: "Success",
+			message: `Profile '${finalName}' created successfully`,
+			variant: "success",
+		});
+	} catch (error: any) {
+		log.warn(`openCreateProfile: failed to create profile '${trimmed}'`, error);
+		toast(context, {
+			title: "Error",
+			message: `Failed to create profile: ${error?.message || error}`,
+			variant: "error",
+		});
+	}
 }
 
 async function openProfilesMenu(
 	context: Context,
 	prefs: SddPrefs,
-	updatePrefs: (mutation: (draft: SddPrefs) => void) => Promise<void>,
+	updatePrefs: UpdatePrefs,
 ): Promise<void> {
-	const choice = await context.ui.dialog.select({
-		title: "SDD Profile Management",
-		options: [
-			{ title: "Create new SDD profile", value: "create", description: "Create an empty SDD profile" },
-			{ title: "Manage SDD profiles", value: "list", description: "List and activate saved SDD profiles" },
-			{ title: "View project memories", value: "memories", description: "Show recent Engram observations" },
-			{ title: `Badge: ${prefs.badgeVisible ? "On" : "Off"}`, value: "toggle_badge", description: "Show or hide the badge" },
-			{ title: `Badge mode: ${prefs.displayMode === "profile" ? "Profile" : "Model"}`, value: "toggle_mode", description: "Show model info or profile name" },
-			{ title: "Close", value: "__close__" },
-		],
-	});
-	if (choice === "create") {
-		const name = await context.ui.dialog.prompt({ title: "New SDD profile name", placeholder: "Enter profile name" });
-		if (!name || !name.trim()) return;
-		// TODO(tui-v2): port creation (V1 src/dialogs.tsx showCreateProfile ~line 555).
-		toast(context, { title: "Not yet ported", message: `Creation of '${name.trim()}' lands with the full dialog port.`, variant: "warning" });
-	} else if (choice === "list") {
-		// TODO(tui-v2): port remaining list flows (V1 src/dialogs.tsx showProfileList ~line 618).
-		await openProfileList(context);
-	} else if (choice === "memories") {
-		// TODO(tui-v2): port memory dialogs (V1 src/dialogs.tsx showProjectMemoriesMenu ~line 1290).
-		const count = await countRecentMemories(context);
-		toast(context, {
-			title: "Project memories",
-			message: count > 0
-				? `${count} recent observations for ${resolveProjectName(context)}. Full browser lands with the dialog port.`
-				: `No project observations found for ${resolveProjectName(context)}.`,
-			variant: count > 0 ? "success" : "warning",
+	const snapshot = await loadRuntimeSnapshot(context);
+	while (true) {
+		const choice = await context.ui.dialog.select({
+			title: "SDD Profile Management",
+			options: [
+				{ title: "Create new SDD profile", value: "create", description: "Create an empty SDD profile" },
+				{ title: "Manage SDD profiles", value: "list", description: "List and activate saved SDD profiles" },
+				{ title: "View project memories", value: "memories", description: "Show recent Engram observations" },
+				{ title: `Badge: ${prefs.badgeVisible ? "On" : "Off"}`, value: "toggle_badge", description: "Show or hide the badge" },
+				{ title: `Badge mode: ${prefs.displayMode === "profile" ? "Profile" : "Model"}`, value: "toggle_mode", description: "Show model info or profile name" },
+				{ title: "Close", value: "__close__" },
+			],
 		});
-	} else if (choice === "toggle_badge") {
-		await updatePrefs((draft) => {
-			draft.badgeVisible = !draft.badgeVisible;
-		});
-		toast(context, { title: "Badge", message: `Badge ${prefs.badgeVisible ? "hidden" : "shown"}.`, variant: "success" });
-	} else if (choice === "toggle_mode") {
-		await updatePrefs((draft) => {
-			draft.displayMode = draft.displayMode === "model" ? "profile" : "model";
-		});
-		toast(context, { title: "Badge mode", message: "Badge display mode updated.", variant: "success" });
+		if (!choice || choice === "__close__") return;
+		if (choice === "create") {
+			await openCreateProfile(context, snapshot, updatePrefs);
+		} else if (choice === "list") {
+			await openProfileList(context, snapshot, updatePrefs);
+		} else if (choice === "memories") {
+			// TODO(tui-v2): port memory dialogs (V1 src/dialogs.tsx showProjectMemoriesMenu ~line 1290).
+			const count = await countRecentMemories(context);
+			toast(context, {
+				title: "Project memories",
+				message: count > 0
+					? `${count} recent observations for ${resolveProjectName(context)}. Full browser lands with the dialog port.`
+					: `No project observations found for ${resolveProjectName(context)}.`,
+				variant: count > 0 ? "success" : "warning",
+			});
+		} else if (choice === "toggle_badge") {
+			const nextVisible = !prefs.badgeVisible;
+			await updatePrefs((draft) => {
+				draft.badgeVisible = nextVisible;
+			});
+			toast(context, { title: "Badge", message: `Badge ${nextVisible ? "shown" : "hidden"}.`, variant: "success" });
+		} else if (choice === "toggle_mode") {
+			const nextMode = prefs.displayMode === "model" ? "profile" : "model";
+			await updatePrefs((draft) => {
+				draft.displayMode = nextMode;
+			});
+			toast(context, { title: "Badge mode", message: "Badge display mode updated.", variant: "success" });
+		}
 	}
 }
 
