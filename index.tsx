@@ -25,9 +25,7 @@
  * Ported from V1 `src/dialogs.tsx`: showCreateProfile, showProfileList,
  * showProfileDetail (hub + primary/reasoning/fallback submenus, provider and
  * model pickers, bulk actions, versions, delete), handleActivateProfile,
- * showRenameProfile. The project memory browser
- * (showProjectMemoriesMenu ~line 1290) still shows a count toast until its
- * port lands.
+ * showRenameProfile, and showProjectMemoriesMenu (browser + detail + delete).
  */
 
 import * as fs from "node:fs";
@@ -37,7 +35,7 @@ import type { Context } from "@opencode/plugin/tui/context";
 import { Show } from "solid-js";
 import { formatActiveModelBadgeText } from "./components";
 import { createLogger } from "./src/logger";
-import { ensureProfilesDir, resolvePaths } from "./src/config";
+import { ensureProfilesDir, resolveEngramProjectName, resolvePaths, resolveProjectName as resolveConfigProjectName } from "./src/config";
 import {
 	activateProfileFile,
 	deleteProfileFile,
@@ -56,6 +54,9 @@ import {
 } from "./src/profiles";
 import { buildReasoningEditState, updateProfileReasoningEffort } from "./src/profile-reasoning";
 import {
+	ACTIVE_PROFILE_NAME_KV_KEY,
+	BADGE_DISPLAY_MODE_KV_KEY,
+	BADGE_VISIBLE_KV_KEY,
 	buildBulkProfileActionOptions,
 	buildFallbackSubmenuOptions,
 	buildPrimaryModelSubmenuOptions,
@@ -69,21 +70,20 @@ import {
 	resolveProfileDetailSelectionAction,
 	resolveRuntimeOrchestratorPolicy,
 } from "./src/dialogs";
-import { listProjectMemories } from "./src/memories";
+import { deleteProjectMemory, listProjectMemories } from "./src/memories";
 import { setActiveProfile } from "./src/state";
 import { NAV_CATEGORY } from "./src/types";
-import type { ActiveProfileState } from "./src/types";
+import type { ActiveProfileState, EngramObservation } from "./src/types";
 import { formatContext, formatMemoryDate, isPrimarySddAgent, parseActiveProfileFromRaw, truncateText } from "./src/utils";
 
 const log = createLogger("tui");
-
-const ENGRAM_PORT_NAME = "ENGRAM_PORT";
-const ENGRAM_HOST = "127.0.0.1";
 
 type SddPrefs = {
 	badgeVisible: boolean;
 	displayMode: "model" | "profile";
 	activeProfileName: string;
+	/** Set once the best-effort V1 kv copy has run (fresh or migrated). */
+	migrated: boolean;
 };
 
 type UpdatePrefs = (mutation: (draft: SddPrefs) => void) => Promise<void>;
@@ -92,6 +92,7 @@ const initialPrefs: SddPrefs = {
 	badgeVisible: true,
 	displayMode: "model",
 	activeProfileName: "",
+	migrated: false,
 };
 
 /**
@@ -135,13 +136,6 @@ function intsToHex(r: number, g: number, b: number): string {
 	return `#${channel(r)}${channel(g)}${channel(b)}`;
 }
 
-function resolveProjectName(context: Context): string {
-	const directory = context.location?.directory;
-	if (!directory) return "project";
-	const base = path.basename(directory).trim().toLowerCase();
-	return base || "project";
-}
-
 function resolveSessionAgentName(context: Context, sessionID?: string): string | undefined {
 	if (!sessionID) return undefined;
 	try {
@@ -183,27 +177,6 @@ function resolveBadgeProfile(context: Context, sessionID?: string): ActiveProfil
 	} catch (error) {
 		log.warn("resolveBadgeProfile: failed to resolve badge profile", error);
 		return null;
-	}
-}
-
-/**
- * Lists recent Engram observations for the current project.
- * Prefers `context.client` when it can serve observations; the V2 client
- * exposes no observations endpoint today, so this keeps the raw Engram HTTP
- * fetch (`http://127.0.0.1:7437`, port via `ENGRAM_PORT`) shared with V1.
- */
-async function countRecentMemories(context: Context): Promise<number> {
-	try {
-		const memories = await listProjectMemories({
-			state: { path: { directory: context.location?.directory } },
-		});
-		return memories.length;
-	} catch (error) {
-		log.warn(
-			`countRecentMemories: Engram fetch to ${ENGRAM_HOST} failed (port via ${ENGRAM_PORT_NAME})`,
-			error,
-		);
-		return 0;
 	}
 }
 
@@ -377,6 +350,54 @@ function buildV1Shim(context: Context, snapshot: RuntimeSnapshot): any {
 			},
 		},
 	};
+}
+
+// ---------------------------------------------------------------------------
+// Storage migration (V1 `api.kv` -> V2 `context.storage.store`)
+// ---------------------------------------------------------------------------
+
+/**
+ * Best-effort read of a V1 kv key. The V2 TUI context exposes no reader for
+ * the V1 host kv store, so this probes a compat channel when one is present
+ * and yields undefined otherwise (V2 defaults stand).
+ */
+async function readLegacyV1Pref(context: Context, key: string): Promise<unknown> {
+	try {
+		const kv = (context as unknown as { kv?: { get?: (key: string) => Promise<unknown> } })?.kv;
+		if (kv && typeof kv.get === "function") return await kv.get(key);
+	} catch (error) {
+		log.warn(`readLegacyV1Pref: failed to read V1 key '${key}'`, error);
+	}
+	return undefined;
+}
+
+/**
+ * One-time copy-on-first-run from the V1 kv keys
+ * (`sdd-show-model-badge`, `sdd-badge-display-mode`,
+ * `sdd-active-profile-name`) into the V2 `sdd-prefs` store. Guarded by
+ * `migrated`; absent legacy values keep the V2 defaults.
+ */
+async function migrateV1PrefsOnce(context: Context, prefs: SddPrefs, updatePrefs: UpdatePrefs): Promise<void> {
+	if (prefs.migrated) return;
+	const [legacyVisible, legacyMode, legacyActive] = await Promise.all([
+		readLegacyV1Pref(context, BADGE_VISIBLE_KV_KEY),
+		readLegacyV1Pref(context, BADGE_DISPLAY_MODE_KV_KEY),
+		readLegacyV1Pref(context, ACTIVE_PROFILE_NAME_KV_KEY),
+	]);
+	const nextVisible = typeof legacyVisible === "boolean" ? legacyVisible : prefs.badgeVisible;
+	const nextMode = legacyMode === "model" || legacyMode === "profile" ? legacyMode : prefs.displayMode;
+	const nextActive =
+		typeof legacyActive === "string" && legacyActive.trim() ? legacyActive.trim() : prefs.activeProfileName;
+	try {
+		await updatePrefs((draft) => {
+			draft.badgeVisible = nextVisible;
+			draft.displayMode = nextMode;
+			draft.activeProfileName = nextActive;
+			draft.migrated = true;
+		});
+	} catch (error) {
+		log.warn("migrateV1PrefsOnce: failed to persist migrated prefs", error);
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -971,11 +992,135 @@ async function openCreateProfile(
 	}
 }
 
+/** Cleans memory text for display (mirrors V1 `showMemoryDetail`). */
+function sanitizeMemoryDisplayText(value: string): string {
+	return value
+		.replace(/\*\*(.*?)\*\*/g, "$1")
+		.replace(/`([^`]+)`/g, "$1")
+		.replace(/[“”]/g, '"')
+		.replace(/[‘’]/g, "'")
+		.replace(/→/g, "->");
+}
+
+/** Wraps long memory text lines to fit within the dialog width. */
+function wrapDisplayText(value: string, max = 52): string[] {
+	if (!value) return [" "];
+	const words = sanitizeMemoryDisplayText(value).split(/\s+/).filter(Boolean);
+	if (words.length === 0) return [" "];
+
+	const lines: string[] = [];
+	let current = "";
+
+	for (const word of words) {
+		if (!current) {
+			current = word;
+			continue;
+		}
+
+		if (`${current} ${word}`.length <= max) {
+			current = `${current} ${word}`;
+			continue;
+		}
+
+		lines.push(current);
+		current = word;
+	}
+
+	if (current) lines.push(current);
+	return lines.length > 0 ? lines : [value];
+}
+
+/** Ports V1 `showMemoryDetail` + `showDeleteMemory`. */
+async function openMemoryDetail(context: Context, memory: EngramObservation): Promise<void> {
+	while (true) {
+		const title = memory.title || memory.topic_key || `Memory #${memory.id}`;
+		const metadata = `[${(memory.type || "manual").toUpperCase()}] ${formatMemoryDate(
+			memory.updated_at || memory.created_at,
+		)} · ${memory.scope || "project"}`;
+		const contentLines = (memory.content || "No content")
+			.split("\n")
+			.flatMap((line) => wrapDisplayText(line || " "));
+
+		const choice = await context.ui.dialog.select<string>({
+			title: truncateText(title, 60),
+			options: [
+				{ title: metadata, value: "__meta__", category: "Memory" },
+				...contentLines.map((line, index) => ({ title: line || " ", value: `__line__${index}` })),
+				{ title: "✕ Delete Memory", value: "__delete__", category: NAV_CATEGORY },
+				{ title: "← Back", value: "__back__", category: NAV_CATEGORY },
+			],
+		});
+		if (!choice || choice === "__back__") return;
+		if (choice === "__delete__") {
+			const confirmed = await context.ui.dialog.confirm({
+				title: "Delete Memory",
+				message: `Permanently delete '${truncateText(title, 48)}'?`,
+			});
+			if (!confirmed) continue;
+			try {
+				await deleteProjectMemory(memory.id);
+				toast(context, { title: "Deleted", message: "Memory deleted successfully", variant: "success" });
+				return;
+			} catch (error: any) {
+				log.warn(`openMemoryDetail: failed to delete memory ${memory?.id}`, error);
+				toast(context, { title: "Error", message: error?.message || "Failed to delete memory", variant: "error" });
+			}
+		}
+	}
+}
+
+/** Ports V1 `showProjectMemoriesMenu` (~line 1290). */
+async function openProjectMemoriesMenu(context: Context): Promise<void> {
+	// `listProjectMemories` resolves project candidates from
+	// `state.path.directory`, so the shim carries the V2 location directory.
+	const shim = { state: { path: { directory: context.location?.directory } } };
+	const projectName = resolveEngramProjectName(shim) || resolveConfigProjectName(shim) || "project";
+
+	while (true) {
+		let memories: EngramObservation[];
+		try {
+			memories = await listProjectMemories(shim);
+		} catch (error: any) {
+			log.warn(`openProjectMemoriesMenu: failed to load memories for ${projectName}`, error);
+			toast(context, { title: "Error", message: `Failed to load memories: ${error?.message || error}`, variant: "error" });
+			return;
+		}
+
+		if (memories.length === 0) {
+			toast(context, {
+				title: "No Memories",
+				message: `No project observations found for ${projectName}`,
+				variant: "warning",
+			});
+			return;
+		}
+
+		const choice = await context.ui.dialog.select<string>({
+			title: `Memories: ${projectName}`,
+			options: [
+				...memories.map((memory) => ({
+					title: truncateText(`[${memory.id}] ${memory.title || memory.topic_key || `Memory #${memory.id}`}`, 60),
+					value: String(memory.id),
+					description: `[${(memory.type || "manual").toUpperCase()}] ${formatMemoryDate(
+						memory.updated_at || memory.created_at,
+					)} · ${memory.scope || "project"}`,
+				})),
+				{ title: "← Back", value: "__back__", category: NAV_CATEGORY },
+			],
+		});
+		if (!choice || choice === "__back__") return;
+		const memory = memories.find((item) => String(item.id) === choice);
+		if (!memory) continue;
+		await openMemoryDetail(context, memory);
+	}
+}
+
 async function openProfilesMenu(
 	context: Context,
 	prefs: SddPrefs,
 	updatePrefs: UpdatePrefs,
 ): Promise<void> {
+	await migrateV1PrefsOnce(context, prefs, updatePrefs);
 	const snapshot = await loadRuntimeSnapshot(context);
 	while (true) {
 		const choice = await context.ui.dialog.select({
@@ -995,15 +1140,7 @@ async function openProfilesMenu(
 		} else if (choice === "list") {
 			await openProfileList(context, snapshot, updatePrefs);
 		} else if (choice === "memories") {
-			// TODO(tui-v2): port memory dialogs (V1 src/dialogs.tsx showProjectMemoriesMenu ~line 1290).
-			const count = await countRecentMemories(context);
-			toast(context, {
-				title: "Project memories",
-				message: count > 0
-					? `${count} recent observations for ${resolveProjectName(context)}. Full browser lands with the dialog port.`
-					: `No project observations found for ${resolveProjectName(context)}.`,
-				variant: count > 0 ? "success" : "warning",
-			});
+			await openProjectMemoriesMenu(context);
 		} else if (choice === "toggle_badge") {
 			const nextVisible = !prefs.badgeVisible;
 			await updatePrefs((draft) => {
