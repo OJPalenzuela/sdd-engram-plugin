@@ -1,295 +1,381 @@
 /** @jsxImportSource @opentui/solid */
 /**
- * SDD Model Select Plugin Entry Point
+ * SDD Model Select — OpenCode V2 native `./tui` entry.
  *
- * This plugin allows users to manage and switch between different SDD profiles,
- * providing a visual badge for the active model and project-specific memory management.
+ * Total V2 cutover: `./tui` IS V2 (no parallel `./tui-v2`). This file is
+ * built as `dist/tui.js` via `Plugin.define` from `@opencode/plugin/tui`.
+ *
+ * V1 -> V2 mapping applied here:
+ * - `api.kv` -> `context.storage.store("sdd-prefs", ...)` (durable JSON).
+ *   V2 storage starts fresh; V1 kv keys (`sdd-show-model-badge`, ...) are
+ *   NOT migrated automatically.
+ * - slots `home_bottom`/`sidebar_content` -> `home.footer.status` /
+ *   `sidebar.content` via `context.ui.slot`.
+ * - `api.keymap.registerLayer` -> `context.keymap.layer` inside the mounted
+ *   `SddGlobalKeymap` component (mode `global`, one palette command).
+ * - `api.ui.dialog` JSX components -> promise-based
+ *   `context.ui.dialog.select/confirm/prompt` + `context.ui.toast.show`.
+ *
+ * Full 15-dialog port is deferred: every stub below names the V1 source in
+ * src/dialogs.tsx to port next.
  */
 
-import * as fs from "node:fs";
-import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui";
-import { registerExCommands } from "@opentui/keymap/addons";
-import { Show, createEffect, createRoot, untrack } from "solid-js";
-import { ActiveModelBadge } from "./components";
-import { readPluginShortcutBindings, resolvePaths } from "./src/config";
-import {
-	ACTIVE_PROFILE_NAME_KV_KEY,
-	BADGE_DISPLAY_MODE_KV_KEY,
-	BADGE_VISIBLE_KV_KEY,
-	registerDialogCallbacks,
-	showProfileDetail,
-	showProfileList,
-	showProfilesMenu,
-	showProjectMemoriesMenu,
-} from "./src/dialogs";
-import {
-	getHostVersion,
-	safeHostAction,
-	safeHostAsyncAction,
-	safeSlotRender,
-} from "./src/host-compat";
+import * as path from "node:path";
+import { Plugin, usePlugin } from "@opencode/plugin/tui";
+import type { Context } from "@opencode/plugin/tui/context";
+import { Show } from "solid-js";
+import { formatActiveModelBadgeText } from "./components";
 import { createLogger } from "./src/logger";
-import { getOrchestratorPolicy } from "./src/orchestrator";
-import { migrateProfilesForRuntimePolicy } from "./src/profiles";
-// Direct imports to avoid barrel resolution issues in some environments
-import {
-	activeProfile,
-	badgeDisplayMode,
-	setActiveProfile,
-	setBadgeDisplayMode,
-	setShowModelBadge,
-	showModelBadge,
-} from "./src/state";
-import type { BadgeDisplayMode } from "./src/types";
-import {
-	parseActiveProfileFromRaw,
-	resolveSessionActiveModel,
-} from "./src/utils";
-
-// -- Plugin Initialization ---------------------------------------------------
+import { listProjectMemories } from "./src/memories";
+import { listProfileFiles } from "./src/profiles";
+import type { ActiveProfileState } from "./src/types";
+import { isPrimarySddAgent } from "./src/utils";
 
 const log = createLogger("tui");
 
-/**
- * Initializes dialog callbacks to resolve circular dependencies between different UI views.
- */
-function initializeDialogs() {
-	registerDialogCallbacks({
-		showProfilesMenu,
-		showProfileList,
-		showProfileDetail,
-		showProjectMemoriesMenu,
-	});
-}
+const ENGRAM_PORT_NAME = "ENGRAM_PORT";
+const ENGRAM_HOST = "127.0.0.1";
 
-async function readKv(api: any, key: string): Promise<unknown> {
+type SddPrefs = {
+	badgeVisible: boolean;
+	displayMode: "model" | "profile";
+	activeProfileName: string;
+};
+
+const initialPrefs: SddPrefs = {
+	badgeVisible: true,
+	displayMode: "model",
+	activeProfileName: "",
+};
+
+/**
+ * Converts a V2 theme token to a `#rrggbb` string for `fg` props.
+ * V2 tokens are `RGBA` class instances (see `@opencode/theme`); plain CSS
+ * strings pass through and anything else falls back.
+ */
+export function rgbaToHex(color: unknown, fallback = "#888888"): string {
+	if (typeof color === "string" && color.length > 0) return color;
 	try {
-		return await api?.kv?.get?.(key);
+		const candidate = color as {
+			toInts?: () => [number, number, number, number];
+			r?: unknown;
+			g?: unknown;
+			b?: unknown;
+		};
+		if (typeof candidate?.toInts === "function") {
+			const [r, g, b] = candidate.toInts();
+			return intsToHex(r, g, b);
+		}
+		if (
+			typeof candidate?.r === "number" &&
+			typeof candidate?.g === "number" &&
+			typeof candidate?.b === "number"
+		) {
+			// Accept 0-1 floats or 0-255 ints.
+			const scale = candidate.r <= 1 && candidate.g <= 1 && candidate.b <= 1 ? 255 : 1;
+			return intsToHex(candidate.r * scale, candidate.g * scale, candidate.b * scale);
+		}
 	} catch (error) {
-		log.warn(`readKv: failed to read '${key}'`, error);
-		return undefined;
+		log.warn("rgbaToHex: failed to convert theme token", error);
 	}
+	return fallback;
 }
 
-function isBadgeDisplayMode(value: unknown): value is BadgeDisplayMode {
-	return value === "model" || value === "profile";
+function intsToHex(r: number, g: number, b: number): string {
+	const channel = (value: number): string =>
+		Math.max(0, Math.min(255, Math.round(value)))
+			.toString(16)
+			.padStart(2, "0");
+	return `#${channel(r)}${channel(g)}${channel(b)}`;
 }
 
-async function loadBadgePreferences(api: any): Promise<void> {
-	const [visible, mode] = await Promise.all([
-		readKv(api, BADGE_VISIBLE_KV_KEY),
-		readKv(api, BADGE_DISPLAY_MODE_KV_KEY),
-	]);
-	const hidden = visible === false || visible === "false";
-	setShowModelBadge(!hidden);
-	setBadgeDisplayMode(isBadgeDisplayMode(mode) ? mode : "model");
+function resolveProjectName(context: Context): string {
+	const directory = context.location?.directory;
+	if (!directory) return "project";
+	const base = path.basename(directory).trim().toLowerCase();
+	return base || "project";
 }
 
-async function readPersistedProfileName(api: any): Promise<string | undefined> {
-	const value = await readKv(api, ACTIVE_PROFILE_NAME_KV_KEY);
-	return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
-
-/**
- * Reads the currently active profile from the local configuration file.
- *
- * @param api - The TUI API instance
- * @returns The active profile state or null if not found/invalid
- */
-async function readActiveProfile(api: any) {
-	const { configPath } = resolvePaths();
+function resolveSessionAgentName(context: Context, sessionID?: string): string | undefined {
+	if (!sessionID) return undefined;
 	try {
-		if (!fs.existsSync(configPath)) return null;
-		const raw = fs.readFileSync(configPath, "utf-8");
-		const profile = parseActiveProfileFromRaw(raw, api);
-		if (!profile) return null;
-		const profileName = await readPersistedProfileName(api);
-		return profileName ? { ...profile, profileName } : profile;
+		const messages = context.data.session.message.list(sessionID) ?? [];
+		for (let index = messages.length - 1; index >= 0; index -= 1) {
+			const agent = (messages[index] as unknown as { agent?: unknown })?.agent;
+			if (typeof agent === "string" && agent.length > 0) return agent;
+		}
 	} catch (error) {
-		log.warn(`readActiveProfile: failed to read ${configPath}`, error);
+		log.warn("resolveSessionAgentName: failed to read session messages", error);
+	}
+	return undefined;
+}
+
+/** Ports the V1 badge/profile read to `data.location.agent.list`. */
+function resolveBadgeProfile(context: Context, sessionID?: string): ActiveProfileState | null {
+	try {
+		const agents = context.data.location.agent.list(context.location) ?? [];
+		const sddAgents = agents.filter((agent) => isPrimarySddAgent(agent.name));
+		if (sddAgents.length === 0) return null;
+
+		const sessionAgent = resolveSessionAgentName(context, sessionID);
+		const selected =
+			sddAgents.find((agent) => agent.name === sessionAgent) ?? sddAgents[0];
+		if (!selected) return null;
+
+		const model = selected.model;
+		if (!model) return null;
+		const models = context.data.location.model.list(context.location) ?? [];
+		const info = models.find(
+			(entry) => entry.providerID === model.providerID && entry.modelID === model.id,
+		);
+		return {
+			modelId: `${model.providerID}/${model.id}`,
+			modelName: info?.name ?? model.id,
+			providerName: model.providerID,
+			contextLimit: info?.limit?.context ?? null,
+		};
+	} catch (error) {
+		log.warn("resolveBadgeProfile: failed to resolve badge profile", error);
 		return null;
 	}
 }
 
-function resolveDisplayedModel(api: any, sessionId?: string) {
-	return resolveSessionActiveModel(api, sessionId) || activeProfile();
-}
-
-function openProfiles(api: any) {
-	showProfilesMenu(api);
-}
-
-function registerProfilesCommand(api: any, bindings: string[]) {
-	createRoot((disposeRoot) => {
-		api.lifecycle.onDispose(disposeRoot);
-
-		const disposeEx = registerExCommands(api.keymap);
-		api.lifecycle.onDispose(disposeEx);
-
-		const disposeLayer = api.keymap.registerLayer({
-			priority: 100,
-			commands: [
-				{
-					name: ":sdd-model",
-					title: "󰓅 SDD Profiles",
-					desc: "Manage SDD profiles",
-					category: "SDD",
-					nargs: "0",
-					run: () => {
-						safeHostAction("open profiles menu", () => openProfiles(api), undefined);
-						return true;
-					},
-				},
-			],
-			bindings: bindings.map((key) => ({ key, cmd: ":sdd-model" })),
+/**
+ * Lists recent Engram observations for the current project.
+ * Prefers `context.client` when it can serve observations; the V2 client
+ * exposes no observations endpoint today, so this keeps the raw Engram HTTP
+ * fetch (`http://127.0.0.1:7437`, port via `ENGRAM_PORT`) shared with V1.
+ */
+async function countRecentMemories(context: Context): Promise<number> {
+	try {
+		const memories = await listProjectMemories({
+			state: { path: { directory: context.location?.directory } },
 		});
-		api.lifecycle.onDispose(disposeLayer);
-
-		if (api.command?.register) {
-			const disposeLegacy = api.command.register(() => [
-				{
-					title: "󰓅 SDD Profiles",
-					value: "sdd-model",
-					description: "Manage SDD profiles",
-					category: "SDD",
-					slash: { name: "sdd-model" },
-					onSelect: () =>
-						safeHostAction("open profiles menu", () => openProfiles(api), undefined),
-				},
-			]);
-			api.lifecycle.onDispose(disposeLegacy);
-		}
-	});
+		return memories.length;
+	} catch (error) {
+		log.warn(
+			`countRecentMemories: Engram fetch to ${ENGRAM_HOST} failed (port via ${ENGRAM_PORT_NAME})`,
+			error,
+		);
+		return 0;
+	}
 }
 
-function renderSlot(api: any, label: string, render: () => any) {
-	return createRoot((dispose) => {
-		api.lifecycle.onDispose(dispose);
-		return safeSlotRender(label, render);
-	});
+function toast(context: Context, options: { title?: string; message: string; variant?: "info" | "success" | "warning" | "error" }): void {
+	try {
+		context.ui.toast.show(options);
+	} catch (error) {
+		log.warn("toast: failed to show toast", error);
+	}
 }
 
-function registerSlots(api: any) {
-	createRoot((dispose) => {
-		api.lifecycle.onDispose(dispose);
+async function openProfileHub(
+	context: Context,
+	fileName: string,
+): Promise<void> {
+	const title = fileName.replace(/\.json$/, "");
+	const choice = await context.ui.dialog.select({
+		title: `Profile: ${title}`,
+		options: [
+			{ title: "Activate profile", value: "activate", description: "Apply to global configuration" },
+			{ title: "Rename profile", value: "rename", description: "Rename the profile file" },
+			{ title: "Back", value: "__back__" },
+		],
+	});
+	if (choice === "activate") {
+		const confirmed = await context.ui.dialog.confirm({
+			title: "Activate profile",
+			message: `Apply '${title}' to the global configuration?`,
+		});
+		if (!confirmed) return;
+		// TODO(tui-v2): port activation (V1 src/dialogs.tsx handleActivateProfile ~line 856).
+		toast(context, { title: "Not yet ported", message: `Activation of '${title}' lands with the full dialog port.`, variant: "warning" });
+		return;
+	}
+	if (choice === "rename") {
+		const next = await context.ui.dialog.prompt({ title: "Rename profile", value: title });
+		if (!next || next.trim() === title) return;
+		// TODO(tui-v2): port rename (V1 src/dialogs.tsx showRenameProfile ~line 907).
+		toast(context, { title: "Not yet ported", message: `Rename to '${next.trim()}' lands with the full dialog port.`, variant: "warning" });
+	}
+}
 
-		api.slots.register({
-			slots: {
-				home_bottom(ctx: any) {
-					return renderSlot(api, "home_bottom", () => {
-						const route = api.route.current;
-						const sessionId =
-							route.name === "session" ? route.params?.sessionID : undefined;
-						return (
-							<Show when={showModelBadge()}>
-								<ActiveModelBadge
-									profile={resolveDisplayedModel(api, sessionId)}
-									theme={ctx.theme.current}
-									displayMode={badgeDisplayMode()}
-								/>
-							</Show>
-						);
+async function openProfileList(context: Context): Promise<void> {
+	let files: string[];
+	try {
+		files = listProfileFiles();
+	} catch (error) {
+		log.warn("openProfileList: failed to list profiles", error);
+		files = [];
+	}
+	if (files.length === 0) {
+		toast(context, { title: "No profiles", message: "No saved profiles found. Create one first!", variant: "warning" });
+		return;
+	}
+	const choice = await context.ui.dialog.select({
+		title: "Select SDD profile",
+		options: [
+			...files.map((file) => ({
+				title: file.replace(/\.json$/, ""),
+				value: file,
+				description: "SDD profile",
+			})),
+			{ title: "Back", value: "__back__" },
+		],
+	});
+	if (!choice || choice === "__back__") return;
+	// TODO(tui-v2): port full detail hub (V1 src/dialogs.tsx showProfileDetail ~line 662).
+	await openProfileHub(context, choice);
+}
+
+async function openProfilesMenu(
+	context: Context,
+	prefs: SddPrefs,
+	updatePrefs: (mutation: (draft: SddPrefs) => void) => Promise<void>,
+): Promise<void> {
+	const choice = await context.ui.dialog.select({
+		title: "SDD Profile Management",
+		options: [
+			{ title: "Create new SDD profile", value: "create", description: "Create an empty SDD profile" },
+			{ title: "Manage SDD profiles", value: "list", description: "List and activate saved SDD profiles" },
+			{ title: "View project memories", value: "memories", description: "Show recent Engram observations" },
+			{ title: `Badge: ${prefs.badgeVisible ? "On" : "Off"}`, value: "toggle_badge", description: "Show or hide the badge" },
+			{ title: `Badge mode: ${prefs.displayMode === "profile" ? "Profile" : "Model"}`, value: "toggle_mode", description: "Show model info or profile name" },
+			{ title: "Close", value: "__close__" },
+		],
+	});
+	if (choice === "create") {
+		const name = await context.ui.dialog.prompt({ title: "New SDD profile name", placeholder: "Enter profile name" });
+		if (!name || !name.trim()) return;
+		// TODO(tui-v2): port creation (V1 src/dialogs.tsx showCreateProfile ~line 555).
+		toast(context, { title: "Not yet ported", message: `Creation of '${name.trim()}' lands with the full dialog port.`, variant: "warning" });
+	} else if (choice === "list") {
+		// TODO(tui-v2): port remaining list flows (V1 src/dialogs.tsx showProfileList ~line 618).
+		await openProfileList(context);
+	} else if (choice === "memories") {
+		// TODO(tui-v2): port memory dialogs (V1 src/dialogs.tsx showProjectMemoriesMenu ~line 1290).
+		const count = await countRecentMemories(context);
+		toast(context, {
+			title: "Project memories",
+			message: count > 0
+				? `${count} recent observations for ${resolveProjectName(context)}. Full browser lands with the dialog port.`
+				: `No project observations found for ${resolveProjectName(context)}.`,
+			variant: count > 0 ? "success" : "warning",
+		});
+	} else if (choice === "toggle_badge") {
+		await updatePrefs((draft) => {
+			draft.badgeVisible = !draft.badgeVisible;
+		});
+		toast(context, { title: "Badge", message: `Badge ${prefs.badgeVisible ? "hidden" : "shown"}.`, variant: "success" });
+	} else if (choice === "toggle_mode") {
+		await updatePrefs((draft) => {
+			draft.displayMode = draft.displayMode === "model" ? "profile" : "model";
+		});
+		toast(context, { title: "Badge mode", message: "Badge display mode updated.", variant: "success" });
+	}
+}
+
+function SddBadge(props: { context: Context; prefs: SddPrefs; sessionID?: string }) {
+	const context = props.context;
+	const theme = context.theme;
+	const accent = rgbaToHex(theme.text.feedback.success.base, "#00ff00");
+	const muted = rgbaToHex(theme.text.muted, "#888888");
+	const base = rgbaToHex(theme.text.base, "#ffffff");
+	const profile = resolveBadgeProfile(context, props.sessionID);
+	return (
+		<Show when={props.prefs.badgeVisible}>
+			<box flexDirection="row" alignItems="center" paddingLeft={1} paddingRight={1}>
+				<text fg={profile ? accent : muted} attributes={profile ? 1 : 0}>
+					{profile ? "󰚩 " : "󱚧 "}
+				</text>
+				<text fg={base}>
+					{formatActiveModelBadgeText(profile, props.prefs.displayMode)}
+				</text>
+			</box>
+		</Show>
+	);
+}
+
+/** Mounted once via the `app` slot; owns the plugin keymap layer. */
+function SddGlobalKeymap() {
+	const context = usePlugin();
+	context.keymap.layer(() => ({
+		mode: "global",
+		commands: [
+			{
+				id: "sdd-model",
+				title: "SDD Profiles",
+				group: "SDD",
+				palette: true,
+				run: () => {
+					const [prefs, updatePrefs] = context.storage.store<SddPrefs>("sdd-prefs", {
+						initial: initialPrefs,
+					});
+					void openProfilesMenu(context, prefs, updatePrefs).catch((error) => {
+						log.warn("sdd-model command: profiles menu failed", error);
 					});
 				},
-				sidebar_content(ctx: any) {
-					return renderSlot(api, "sidebar_content", () => (
-						<Show when={showModelBadge()}>
-							<ActiveModelBadge
-								profile={resolveDisplayedModel(api, ctx.session_id)}
-								theme={ctx.theme.current}
-								displayMode={badgeDisplayMode()}
-							/>
-						</Show>
-					));
-				},
 			},
-		});
-	});
+		],
+		bindings: ["sdd-model"],
+	}));
+	return null;
 }
 
-// -- Plugin Entry ------------------------------------------------------------
-
-const id = "sdd-model-select";
-
-/**
- * Main TUI plugin entry function
- * Registers commands and UI slots for the plugin
- */
-const tui: TuiPlugin = async (api) => {
-	safeHostAction("log host version", () => {
-		log.info(`host opencode v${getHostVersion(api)}`);
-	}, undefined);
-
-	// Initialize dialog callbacks
-	safeHostAction("initialize dialogs", initializeDialogs, undefined);
-
-	const runtimePolicy = safeHostAction(
-		"resolve orchestrator policy",
-		() =>
-			getOrchestratorPolicy(
-				Object.keys(api?.state?.config?.agent || {}),
-				api?.state?.config?.default_agent,
-			),
-		undefined,
-	);
-	if (runtimePolicy) {
-		safeHostAction(
-			"migrate profiles for runtime policy",
-			() => migrateProfilesForRuntimePolicy(runtimePolicy),
-			undefined,
-		);
-	}
-
-	await safeHostAsyncAction(
-		"load badge preferences",
-		() => loadBadgePreferences(api),
-		undefined,
-	);
-
-	const shortcutBindings = safeHostAction(
-		"load plugin shortcut bindings",
-		() => readPluginShortcutBindings(),
-		["alt+k", "super+k"],
-	);
-
-	// Load and set the active profile in the global state
-	const profile = await safeHostAsyncAction(
-		"read active profile",
-		() => readActiveProfile(api),
-		null,
-	);
-	safeHostAction("set active profile", () => setActiveProfile(profile), undefined);
-
-	// Keep the active profile in sync with global config changes.
-	safeHostAction("sync active profile", () => {
-		createRoot((dispose) => {
-			api.lifecycle.onDispose(dispose);
-			createEffect(() => {
-				safeHostAction("sync active profile update", () => {
-					const currentConfig = api.state.config;
-					if (!currentConfig) return;
-					const next = parseActiveProfileFromRaw(JSON.stringify(currentConfig), api);
-					if (!next) {
-						setActiveProfile(null);
-						return;
-					}
-					const previousProfileName = untrack(() => activeProfile()?.profileName);
-					setActiveProfile(
-						previousProfileName
-							? { ...next, profileName: previousProfileName }
-							: next,
-					);
-				}, undefined);
+export default Plugin.define({
+	id: "sdd-model-select",
+	setup(context) {
+		const disposers: Array<() => void> = [];
+		try {
+			const [prefs, updatePrefs] = context.storage.store<SddPrefs>("sdd-prefs", {
+				initial: initialPrefs,
 			});
-		});
-	}, undefined);
 
-	// Register the main command using the current OpenCode TUI keymap API.
-	safeHostAction("register profiles command", () => registerProfilesCommand(api, shortcutBindings), undefined);
+			disposers.push(
+				context.ui.slot({
+					append: "sidebar.content",
+					render: ({ sessionID }) => (
+						<SddBadge context={context} prefs={prefs} sessionID={sessionID} />
+					),
+				}),
+			);
 
-	// Register UI slots inside a Solid root because the host slot plugin creates cleanups.
-	safeHostAction("register slots", () => registerSlots(api), undefined);
-};
+			disposers.push(
+				context.ui.slot({
+					append: "home.footer.status",
+					render: () => {
+						// Route through context.ui.router so the footer reflects the
+						// current location (session vs home).
+						let sessionID: string | undefined;
+						try {
+							const route = context.ui.router.current();
+							if (route.type === "session") sessionID = route.sessionID;
+						} catch (error) {
+							log.warn("home.footer.status: router read failed", error);
+						}
+						return <SddBadge context={context} prefs={prefs} sessionID={sessionID} />;
+					},
+				}),
+			);
 
-const plugin: TuiPluginModule & { id: string } = { id, tui };
-export default plugin;
+			disposers.push(
+				context.ui.slot({
+					append: "app",
+					render: () => <SddGlobalKeymap />,
+				}),
+			);
+		} catch (error) {
+			log.warn("setup: V2 plugin init failed; OpenCode will continue without SDD UI", error);
+		}
+
+		return () => {
+			for (const dispose of disposers) {
+				try {
+					dispose();
+				} catch (error) {
+					log.warn("cleanup: slot dispose failed", error);
+				}
+			}
+		};
+	},
+});
