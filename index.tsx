@@ -13,7 +13,11 @@
  * - slots `home_bottom`/`sidebar_content` -> `home.footer.status` /
  *   `sidebar.content` via `context.ui.slot`.
  * - `api.keymap.registerLayer` -> `context.keymap.layer` inside the mounted
- *   `SddGlobalKeymap` component (mode `global`, one palette command).
+ *   `SddBadge` component body (mode `global`, one palette command + slash).
+ *   The layer is owned by badge slots that definitely mount
+ *   (`sidebar.content`, `home.footer.status`); a previous `app`-slot owner
+ *   never surfaced in the live TUI, so the palette is never owned solely by
+ *   the unproven `app` slot.
  * - `api.ui.dialog` JSX components -> promise-based
  *   `context.ui.dialog.select/confirm/prompt` + `context.ui.toast.show`.
  * - `api.state.provider/config` -> `context.data.location.*.sync()` +
@@ -30,7 +34,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { Plugin, usePlugin } from "@opencode/plugin/tui";
+import { Plugin } from "@opencode/plugin/tui";
 import type { Context } from "@opencode/plugin/tui/context";
 import { Show } from "solid-js";
 import type { Store } from "solid-js/store";
@@ -1158,8 +1162,84 @@ async function openProfilesMenu(
 	}
 }
 
+/** Opens the SDD profiles menu from the `sdd-model` command (`run`). */
+function openSddMenu(context: Context): void {
+	try {
+		// `storage.store` is synchronous and returns `[state, update]`
+		// (see `@opencode/plugin` storage types); the same key yields the
+		// live-synced store created in `setup`.
+		const [prefs, updatePrefs] = context.storage.store<SddPrefs>("sdd-prefs", {
+			initial: initialPrefs,
+		});
+		void openProfilesMenu(context, prefs, updatePrefs).catch((error) => {
+			log.warn("sdd-model command: profiles menu failed", error);
+		});
+	} catch (error) {
+		log.warn("sdd-model command: failed to open profiles menu", error);
+		toast(context, { title: "Error", message: "Failed to open SDD profiles", variant: "error" });
+	}
+}
+
+/**
+ * Registers the plugin keymap layer. Must run inside a mounted component body
+ * (`context.keymap.layer` is owned by the calling component — see PR99
+ * `useKeymapLayer`, called synchronously from the sidebar component body with
+ * no `createEffect`/`onMount`), never in `setup()`. Called from `SddBadge`,
+ * so the palette command lives and dies with slots that definitely mount
+ * (`sidebar.content`, `home.footer.status`). PR99 proves sidebar-content
+ * ownership; the previous `app`-slot owner never surfaced in the live TUI
+ * (no badge, no palette entry, zero errors), so the palette is never owned
+ * solely by the unproven `app` slot.
+ */
+function useSddKeymapLayer(context: Context): void {
+	// V1 parity: shortcuts come from `sdd-model-select.json`
+	// (`readPluginShortcutBindings`, default Alt+K/Cmd+K). `KeymapCommand.bind`
+	// holds a single binding string, so the first binding goes on the named
+	// palette command and any extras ride as inline commands sharing `run`.
+	// (The old top-level `bindings: ["sdd-model"]` only activated
+	// user-configured bindings for that id — it never created the default
+	// shortcut, so the keyboard shortcut was dead. Removed.)
+	let shortcutBindings: string[];
+	try {
+		shortcutBindings = readPluginShortcutBindings();
+	} catch (error) {
+		log.warn("useSddKeymapLayer: failed to read shortcut bindings, using defaults", error);
+		shortcutBindings = ["alt+k", "super+k"];
+	}
+	if (shortcutBindings.length === 0) shortcutBindings = ["alt+k", "super+k"];
+	const openMenu = (): void => openSddMenu(context);
+	const [primaryBinding, ...extraBindings] = shortcutBindings;
+	try {
+		context.keymap.layer(() => ({
+			mode: "global",
+			commands: [
+				{
+					id: "sdd-model",
+					title: "SDD Profiles",
+					group: "SDD",
+					bind: primaryBinding,
+					palette: true,
+					// Slash registration: `/sdd-model` works in the prompt
+					// regardless of palette discovery.
+					slash: { name: "sdd-model" },
+					run: openMenu,
+				},
+				...extraBindings.map((binding) => ({
+					bind: binding,
+					run: openMenu,
+				})),
+			],
+		}));
+	} catch (error) {
+		log.warn("useSddKeymapLayer: failed to register keymap layer", error);
+	}
+}
+
 function SddBadge(props: { context: Context; prefs: SddPrefs; sessionID?: string }) {
 	const context = props.context;
+	// Own the palette command here: this body always executes while the slot
+	// is mounted, even when the badge visuals below are hidden via `Show`.
+	useSddKeymapLayer(context);
 	const theme = context.theme;
 	// Optional chaining + hex fallbacks: a custom/incomplete theme must never
 	// throw inside render and take down the slot.
@@ -1179,61 +1259,6 @@ function SddBadge(props: { context: Context; prefs: SddPrefs; sessionID?: string
 			</box>
 		</Show>
 	);
-}
-
-/** Mounted once via the `app` slot; owns the plugin keymap layer. */
-function SddGlobalKeymap() {
-	const context = usePlugin();
-	// V1 parity: shortcuts come from `sdd-model-select.json`
-	// (`readPluginShortcutBindings`, default Alt+K/Cmd+K). `KeymapCommand.bind`
-	// holds a single binding string, so the first binding goes on the named
-	// palette command and any extras ride as inline commands sharing `run`.
-	// (The old top-level `bindings: ["sdd-model"]` only activated
-	// user-configured bindings for that id — it never created the default
-	// shortcut, so the keyboard shortcut was dead. Removed.)
-	let shortcutBindings: string[];
-	try {
-		shortcutBindings = readPluginShortcutBindings();
-	} catch (error) {
-		log.warn("SddGlobalKeymap: failed to read shortcut bindings, using defaults", error);
-		shortcutBindings = ["alt+k", "super+k"];
-	}
-	if (shortcutBindings.length === 0) shortcutBindings = ["alt+k", "super+k"];
-	const openMenu = (): void => {
-		try {
-			// `storage.store` is synchronous and returns `[state, update]`
-			// (see `@opencode/plugin` storage types); the same key yields the
-			// live-synced store created in `setup`.
-			const [prefs, updatePrefs] = context.storage.store<SddPrefs>("sdd-prefs", {
-				initial: initialPrefs,
-			});
-			void openProfilesMenu(context, prefs, updatePrefs).catch((error) => {
-				log.warn("sdd-model command: profiles menu failed", error);
-			});
-		} catch (error) {
-			log.warn("sdd-model command: failed to open profiles menu", error);
-			toast(context, { title: "Error", message: "Failed to open SDD profiles", variant: "error" });
-		}
-	};
-	const [primaryBinding, ...extraBindings] = shortcutBindings;
-	context.keymap.layer(() => ({
-		mode: "global",
-		commands: [
-			{
-				id: "sdd-model",
-				title: "SDD Profiles",
-				group: "SDD",
-				bind: primaryBinding,
-				palette: true,
-				run: openMenu,
-			},
-			...extraBindings.map((binding) => ({
-				bind: binding,
-				run: openMenu,
-			})),
-		],
-	}));
-	return null;
 }
 
 export default Plugin.define({
@@ -1303,17 +1328,6 @@ export default Plugin.define({
 		} else {
 			fail("slot sidebar.content (skipped: no prefs)", "storage init failed");
 			fail("slot home.footer.status (skipped: no prefs)", "storage init failed");
-		}
-
-		try {
-			disposers.push(
-				context.ui.slot({
-					append: "app",
-					render: () => <SddGlobalKeymap />,
-				}),
-			);
-		} catch (error) {
-			fail("slot app (keymap owner)", error);
 		}
 
 		if (failures.length > 0) {
