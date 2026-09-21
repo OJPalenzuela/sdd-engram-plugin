@@ -33,9 +33,10 @@ import * as path from "node:path";
 import { Plugin, usePlugin } from "@opencode/plugin/tui";
 import type { Context } from "@opencode/plugin/tui/context";
 import { Show } from "solid-js";
+import type { Store } from "solid-js/store";
 import { formatActiveModelBadgeText } from "./components";
 import { createLogger } from "./src/logger";
-import { ensureProfilesDir, resolveEngramProjectName, resolvePaths, resolveProjectName as resolveConfigProjectName } from "./src/config";
+import { ensureProfilesDir, readPluginShortcutBindings, resolveEngramProjectName, resolvePaths, resolveProjectName as resolveConfigProjectName } from "./src/config";
 import {
 	activateProfileFile,
 	deleteProfileFile,
@@ -1160,9 +1161,11 @@ async function openProfilesMenu(
 function SddBadge(props: { context: Context; prefs: SddPrefs; sessionID?: string }) {
 	const context = props.context;
 	const theme = context.theme;
-	const accent = rgbaToHex(theme.text.feedback.success.base, "#00ff00");
-	const muted = rgbaToHex(theme.text.muted, "#888888");
-	const base = rgbaToHex(theme.text.base, "#ffffff");
+	// Optional chaining + hex fallbacks: a custom/incomplete theme must never
+	// throw inside render and take down the slot.
+	const accent = rgbaToHex(theme?.text?.feedback?.success?.base, "#00ff00");
+	const muted = rgbaToHex(theme?.text?.muted, "#888888");
+	const base = rgbaToHex(theme?.text?.base, "#ffffff");
 	const profile = resolveBadgeProfile(context, props.sessionID);
 	return (
 		<Show when={props.prefs.badgeVisible}>
@@ -1181,6 +1184,38 @@ function SddBadge(props: { context: Context; prefs: SddPrefs; sessionID?: string
 /** Mounted once via the `app` slot; owns the plugin keymap layer. */
 function SddGlobalKeymap() {
 	const context = usePlugin();
+	// V1 parity: shortcuts come from `sdd-model-select.json`
+	// (`readPluginShortcutBindings`, default Alt+K/Cmd+K). `KeymapCommand.bind`
+	// holds a single binding string, so the first binding goes on the named
+	// palette command and any extras ride as inline commands sharing `run`.
+	// (The old top-level `bindings: ["sdd-model"]` only activated
+	// user-configured bindings for that id — it never created the default
+	// shortcut, so the keyboard shortcut was dead. Removed.)
+	let shortcutBindings: string[];
+	try {
+		shortcutBindings = readPluginShortcutBindings();
+	} catch (error) {
+		log.warn("SddGlobalKeymap: failed to read shortcut bindings, using defaults", error);
+		shortcutBindings = ["alt+k", "super+k"];
+	}
+	if (shortcutBindings.length === 0) shortcutBindings = ["alt+k", "super+k"];
+	const openMenu = (): void => {
+		try {
+			// `storage.store` is synchronous and returns `[state, update]`
+			// (see `@opencode/plugin` storage types); the same key yields the
+			// live-synced store created in `setup`.
+			const [prefs, updatePrefs] = context.storage.store<SddPrefs>("sdd-prefs", {
+				initial: initialPrefs,
+			});
+			void openProfilesMenu(context, prefs, updatePrefs).catch((error) => {
+				log.warn("sdd-model command: profiles menu failed", error);
+			});
+		} catch (error) {
+			log.warn("sdd-model command: failed to open profiles menu", error);
+			toast(context, { title: "Error", message: "Failed to open SDD profiles", variant: "error" });
+		}
+	};
+	const [primaryBinding, ...extraBindings] = shortcutBindings;
 	context.keymap.layer(() => ({
 		mode: "global",
 		commands: [
@@ -1188,18 +1223,15 @@ function SddGlobalKeymap() {
 				id: "sdd-model",
 				title: "SDD Profiles",
 				group: "SDD",
+				bind: primaryBinding,
 				palette: true,
-				run: () => {
-					const [prefs, updatePrefs] = context.storage.store<SddPrefs>("sdd-prefs", {
-						initial: initialPrefs,
-					});
-					void openProfilesMenu(context, prefs, updatePrefs).catch((error) => {
-						log.warn("sdd-model command: profiles menu failed", error);
-					});
-				},
+				run: openMenu,
 			},
+			...extraBindings.map((binding) => ({
+				bind: binding,
+				run: openMenu,
+			})),
 		],
-		bindings: ["sdd-model"],
 	}));
 	return null;
 }
@@ -1208,38 +1240,72 @@ export default Plugin.define({
 	id: "sdd-model-select",
 	setup(context) {
 		const disposers: Array<() => void> = [];
+		const failures: string[] = [];
+		const fail = (step: string, error: unknown): void => {
+			failures.push(step);
+			// `log` writes to stderr, so the failure stays visible even when
+			// the toast below cannot render yet.
+			log.warn(`setup: ${step} failed; continuing without it`, error);
+		};
+
+		// Each registration below is isolated: one bad slot must never kill
+		// the others. `storage.store` is synchronous and returns
+		// `[state, update]` (see `@opencode/plugin` storage types).
+		let prefs: Store<SddPrefs> | undefined;
 		try {
-			const [prefs, updatePrefs] = context.storage.store<SddPrefs>("sdd-prefs", {
+			const [initial, update] = context.storage.store<SddPrefs>("sdd-prefs", {
 				initial: initialPrefs,
 			});
+			prefs = initial;
+			// `update` is only consumed by the palette command (which
+			// re-reads the store itself); slots render from `prefs`.
+			void update;
+		} catch (error) {
+			fail("storage.store(sdd-prefs)", error);
+		}
 
-			disposers.push(
-				context.ui.slot({
-					append: "sidebar.content",
-					render: ({ sessionID }) => (
-						<SddBadge context={context} prefs={prefs} sessionID={sessionID} />
-					),
-				}),
-			);
+		if (prefs) {
+			const badgePrefs = prefs;
+			try {
+				disposers.push(
+					context.ui.slot({
+						append: "sidebar.content",
+						render: ({ sessionID }) => (
+							<SddBadge context={context} prefs={badgePrefs} sessionID={sessionID} />
+						),
+					}),
+				);
+			} catch (error) {
+				fail("slot sidebar.content", error);
+			}
 
-			disposers.push(
-				context.ui.slot({
-					append: "home.footer.status",
-					render: () => {
-						// Route through context.ui.router so the footer reflects the
-						// current location (session vs home).
-						let sessionID: string | undefined;
-						try {
-							const route = context.ui.router.current();
-							if (route.type === "session") sessionID = route.sessionID;
-						} catch (error) {
-							log.warn("home.footer.status: router read failed", error);
-						}
-						return <SddBadge context={context} prefs={prefs} sessionID={sessionID} />;
-					},
-				}),
-			);
+			try {
+				disposers.push(
+					context.ui.slot({
+						append: "home.footer.status",
+						render: () => {
+							// Route through context.ui.router so the footer reflects the
+							// current location (session vs home).
+							let sessionID: string | undefined;
+							try {
+								const route = context.ui.router.current();
+								if (route.type === "session") sessionID = route.sessionID;
+							} catch (error) {
+								log.warn("home.footer.status: router read failed", error);
+							}
+							return <SddBadge context={context} prefs={badgePrefs} sessionID={sessionID} />;
+						},
+					}),
+				);
+			} catch (error) {
+				fail("slot home.footer.status", error);
+			}
+		} else {
+			fail("slot sidebar.content (skipped: no prefs)", "storage init failed");
+			fail("slot home.footer.status (skipped: no prefs)", "storage init failed");
+		}
 
+		try {
 			disposers.push(
 				context.ui.slot({
 					append: "app",
@@ -1247,7 +1313,26 @@ export default Plugin.define({
 				}),
 			);
 		} catch (error) {
-			log.warn("setup: V2 plugin init failed; OpenCode will continue without SDD UI", error);
+			fail("slot app (keymap owner)", error);
+		}
+
+		if (failures.length > 0) {
+			// VISIBLE degradation signal: stderr log above plus a toast, so a
+			// partial init can never pass silently.
+			const message =
+				`SDD plugin partially initialized (${failures.length} step(s) failed: ` +
+				`${failures.join("; ")}. Continuing with the rest. See logs for details.)`;
+			log.warn(`setup: ${message}`);
+			try {
+				context.ui.toast.show({
+					title: "SDD plugin",
+					message,
+					variant: "warning",
+					duration: 8000,
+				});
+			} catch (error) {
+				log.warn("setup: failed to show degradation toast", error);
+			}
 		}
 
 		return () => {
